@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/arn"
+	"github.com/aws/aws-sdk-go/service/iam"
+	"github.com/aws/aws-sdk-go/service/iam/iamiface"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 )
@@ -28,76 +31,104 @@ func stringSliceContains(s string, v []string) bool {
 
 type config struct {
 	ca                   CA
+	iamClient            iamiface.IAMAPI
 	allowedKeyTypes      []string
 	certValidityDuration time.Duration
 }
 
-var unsupportedStsResourceTypeError = errors.New("hallow: unsupported sts resource type")
-var unknowUserArnServiceError = errors.New("hallow: unknown userArn service")
-var malformedAssumedRoleArnError = errors.New("hallow: malformed assumed-role resource")
+func getAdditionalPrincipalsForRole(ctx context.Context, iamClient iamiface.IAMAPI, roleName string) ([]string, error) {
+	response, err := iamClient.GetRoleWithContext(ctx, &iam.GetRoleInput{
+		RoleName: aws.String(roleName),
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, tag := range response.Role.Tags {
+		if aws.StringValue(tag.Key) == "hallow.additional_principals" {
+			return strings.Split(aws.StringValue(tag.Value), ","), nil
+		}
+	}
+	return nil, nil
+}
 
+var errUnsupportedStsResourceType = errors.New("hallow: unsupported sts resource type")
+var errUnknowUserArnService = errors.New("hallow: unknown userArn service")
+var errMalformedAssumedRoleArn = errors.New("hallow: malformed assumed-role resource")
+
+// createPrincipalNames selects which principals will be assigned for a
+// certificate requested by the provided ARN.
+//
 // User ARNs are from IAM, and can take a few forms. The reason why
-// we can't use them directly is that ARNs from STS can have some non-determinism
-// in them, such as the session name.
+// we can't use them directly is that ARNs from STS can have some
+// non-determinism in them, such as the session name.
 //
 // As a result, we'll pass through the ARN if it's an IAM ARN, but if it's
-// STS, we'll trim the ARN down to the first two blocks.
+// STS assumed-role ARN, we'll trim it down to the first two blocks.
 //
 // For more information on this class of nonsense, you may consider
 // https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_identifiers.html
 // for some bedtime reading.
-func createPrincipalName(userArn arn.ARN) (string, error) {
+//
+// For assumed role ARNs we will additionally look up the role, and if it has a
+// Tag named "hallow.additional_principals" will return them.
+func createPrincipalNames(ctx context.Context, iamClient iamiface.IAMAPI, userArn arn.ARN) ([]string, error) {
 	switch userArn.Service {
 	case "sts":
 		chunks := strings.Split(userArn.Resource, "/")
 		switch chunks[0] {
 		case "assumed-role":
 			if len(chunks) != 3 {
-				return "", malformedAssumedRoleArnError
+				return nil, errMalformedAssumedRoleArn
 			}
 			userArn.Resource = fmt.Sprintf("%s/%s", chunks[0], chunks[1])
-			return userArn.String(), nil
+			principals := []string{userArn.String()}
+			additionalPrincipals, err := getAdditionalPrincipalsForRole(
+				ctx, iamClient, chunks[1])
+			if err != nil {
+				return nil, err
+			}
+			return append(principals, additionalPrincipals...), nil
 		default:
-			return "", unsupportedStsResourceTypeError
+			return nil, errUnsupportedStsResourceType
 		}
 	case "iam":
 		// for IAM, we can have a few formats, but all are deterministic
 		// and stable.
-		return userArn.String(), nil
+		return []string{userArn.String()}, nil
 	default:
-		return "", unknowUserArnServiceError
+		return nil, errUnknowUserArnService
 	}
 }
 
-var unknownKeyTypeError = errors.New("hallow: public key is of an unknown type, can't validate")
-var smallRsaKeyError = errors.New("hallow: rsa: key size is too small")
+var errUnknownKeyType = errors.New("hallow: public key is of an unknown type, can't validate")
+var errSmallRsaKey = errors.New("hallow: rsa: key size is too small")
 
 func (c *config) validatePublicKey(sshPubKey ssh.PublicKey) error {
-	_, ok := sshPubKey.(ssh.CryptoPublicKey)
+	cryptoPubKey, ok := sshPubKey.(ssh.CryptoPublicKey)
 	if !ok {
 		return fmt.Errorf("hallow: ssh public key is not a CryptoPublicKey")
 	}
 
-	pubKey := sshPubKey.(ssh.CryptoPublicKey).CryptoPublicKey()
-
-	switch pubKey.(type) {
+	switch pubKey := cryptoPubKey.CryptoPublicKey().(type) {
 	case *rsa.PublicKey:
 		smallestAcceptedSize := 2048
-		if pubKey.(*rsa.PublicKey).N.BitLen() < smallestAcceptedSize {
-			return smallRsaKeyError
+		if pubKey.N.BitLen() < smallestAcceptedSize {
+			return errSmallRsaKey
 		}
 		return nil
 	case *ecdsa.PublicKey, ed25519.PublicKey:
 		return nil
 	default:
-		return unknownKeyTypeError
+		return errUnknownKeyType
 	}
 }
 
 func (c *config) handleRequest(ctx context.Context, event events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	l := log.WithField("request.client_ip", event.RequestContext.Identity.SourceIP)
+
 	userArn, err := arn.Parse(event.RequestContext.Identity.UserArn)
 	if err != nil {
-		log.WithFields(log.Fields{"error": err}).Warn("Incoming ARN is invalid")
+		l.WithError(err).Warn("Incoming ARN is invalid")
 		return events.APIGatewayProxyResponse{
 			Body:       "Malformed request",
 			StatusCode: 400,
@@ -106,16 +137,16 @@ func (c *config) handleRequest(ctx context.Context, event events.APIGatewayProxy
 
 	host, ok := event.Headers["Host"]
 	if !ok {
-		log.Warn("Host header is not present!")
+		l.Warn("Host header is not present!")
 		return events.APIGatewayProxyResponse{
 			Body:       "Malformed request",
 			StatusCode: 400,
 		}, nil
 	}
 
-	principal, err := createPrincipalName(userArn)
+	principals, err := createPrincipalNames(ctx, c.iamClient, userArn)
 	if err != nil {
-		log.WithFields(log.Fields{"error": err}).Warn("Incoming ARN isn't a valid principal")
+		l.WithError(err).Warn("Incoming ARN isn't a valid principal")
 		return events.APIGatewayProxyResponse{
 			Body:       "Malformed request",
 			StatusCode: 400,
@@ -124,14 +155,14 @@ func (c *config) handleRequest(ctx context.Context, event events.APIGatewayProxy
 
 	publicKey, comment, _, _, err := ssh.ParseAuthorizedKey([]byte(event.Body))
 	if err != nil {
-		log.WithFields(log.Fields{"error": err}).Warn("Incoming SSH key is invalid")
+		l.WithError(err).Warn("Incoming SSH key is invalid")
 		return events.APIGatewayProxyResponse{
 			Body:       "Malformed request",
 			StatusCode: 400,
 		}, nil
 
 	}
-	l := log.WithFields(log.Fields{
+	l = l.WithFields(log.Fields{
 		"request.comment":         comment,
 		"request.public_key.type": publicKey.Type(),
 	})
@@ -160,21 +191,21 @@ func (c *config) handleRequest(ctx context.Context, event events.APIGatewayProxy
 
 	var b [8]byte
 	if _, err := c.ca.Rand.Read(b[:]); err != nil {
-		l.WithFields(log.Fields{"error": err}).Warn("Can't create a nonce")
+		l.WithError(err).Warn("Can't create a nonce")
 		return events.APIGatewayProxyResponse{
 			Body:       "Internal server error",
 			StatusCode: 500,
 		}, nil
 	}
 
-	serial := int64(binary.LittleEndian.Uint64(b[:]))
+	serial := binary.LittleEndian.Uint64(b[:])
 	template := ssh.Certificate{
 		Key:             publicKey,
-		Serial:          uint64(serial),
+		Serial:          serial,
 		CertType:        ssh.UserCert,
 		KeyId:           comment,
-		ValidPrincipals: []string{principal},
-		ValidAfter:      uint64(time.Now().Add(-time.Second * 5).Unix()),
+		ValidPrincipals: principals,
+		ValidAfter:      uint64(time.Now().Add(-time.Minute * 1).Unix()),
 		ValidBefore:     uint64(time.Now().Add(c.certValidityDuration).Unix()),
 		Permissions: ssh.Permissions{
 			CriticalOptions: map[string]string{},
@@ -188,12 +219,12 @@ func (c *config) handleRequest(ctx context.Context, event events.APIGatewayProxy
 		},
 	}
 
-	sshCert, _, err := c.ca.SignAndParse(template)
+	sshCert, err := c.ca.Sign(template)
 	if err != nil {
-		l.WithFields(log.Fields{"error": err}).Warn("The CA can't sign the Certificate")
+		l.WithError(err).Warn("The CA can't sign the Certificate")
 		return events.APIGatewayProxyResponse{
-			Body:       "Malformed request",
-			StatusCode: 400,
+			Body:       "Internal server error",
+			StatusCode: 500,
 		}, nil
 	}
 	l.WithFields(log.Fields{

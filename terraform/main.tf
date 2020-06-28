@@ -42,10 +42,15 @@ data "aws_iam_policy_document" "lambda_policy" {
     ]
     resources = [aws_kms_key.ssh_ca_key.arn]
   }
+
+  statement {
+    actions   = ["iam:GetRole"]
+    resources = ["*"]
+  }
 }
 
 resource "aws_cloudwatch_log_group" "log_group" {
-  // Magic name! Lambda is hard coded to which group it logs to, we pre-creat
+  // Magic name! Lambda is hard coded to which group it logs to, we pre-create
   // that to be able to reference in the IAM policy.
   name = "/aws/lambda/hallow"
 }

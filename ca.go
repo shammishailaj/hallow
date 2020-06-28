@@ -6,7 +6,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Implementation of the OpenSSH Certificate Authority.
+// CA is an implementation of the OpenSSH Certificate Authority.
 //
 // This encapsulates the signing code, as well as the RNG source to be used
 // for signing operations. This contains no logic regarding certificate policy
@@ -22,10 +22,9 @@ type CA struct {
 	Signer ssh.Signer
 }
 
-// Sign an SSH Certificate template (with `Key` set), and return the base64
-// encoded ssh key entry (something like `ssh-*-cert`) that the user can
-// import.
-func (s CA) Sign(template ssh.Certificate) ([]byte, error) {
+// Sign an SSH Certificate template (with `Key` set), and return the
+// certificate.
+func (s CA) Sign(template ssh.Certificate) (*ssh.Certificate, error) {
 	return CreateCertificate(
 		s.Rand,
 		template,
@@ -35,29 +34,16 @@ func (s CA) Sign(template ssh.Certificate) ([]byte, error) {
 	)
 }
 
-//
-func (s CA) SignAndParse(template ssh.Certificate) (ssh.PublicKey, []byte, error) {
-	bytes, err := s.Sign(template)
-	if err != nil {
-		return nil, nil, err
-	}
-	pubKey, err := ssh.ParsePublicKey(bytes)
-	if err != nil {
-		return nil, nil, err
-	}
-	return pubKey, bytes, nil
-}
-
-// Create a Certificate. This signature looks similar to the
-// x509.CreateCertificate signature for ease of use.
+// CreateCertificate will create an SSH Certificate with an API that looks
+// similar to the x509.CreateCertificate signature for ease of use.
 func CreateCertificate(
 	rand io.Reader,
 	template ssh.Certificate,
 	parent ssh.PublicKey,
 	pub ssh.PublicKey,
 	priv ssh.Signer,
-) ([]byte, error) {
-	cert := ssh.Certificate{
+) (*ssh.Certificate, error) {
+	cert := &ssh.Certificate{
 		Key:             pub,
 		Serial:          template.Serial,
 		CertType:        template.CertType,
@@ -77,5 +63,5 @@ func CreateCertificate(
 		return nil, err
 	}
 
-	return cert.Marshal(), nil
+	return cert, nil
 }
